@@ -199,6 +199,14 @@ const Vision = (function () {
     const dx = bestShift(colG, colP, SHIFT_X);
     const dy = bestShift(rowG, rowP, SHIFT_Y);
 
+    // 穩定度：整張畫面（投影）相對前一格變化多少（相機晃動會很大；只有球在動則很小）
+    let sumCol = 0, errX = 0, sumRow = 0, errY = 0;
+    for (let x = 0; x < W; x++) { sumCol += colG[x]; errX += Math.abs(colG[x] - colP[x]); }
+    for (let y = 0; y < H; y++) { sumRow += rowG[y]; errY += Math.abs(rowG[y] - rowP[y]); }
+    const rx = (errX / W) / (sumCol / W + 1);
+    const ry = (errY / H) / (sumRow / H + 1);
+    const shake = Math.max(rx, ry);
+
     let sx = 0, sy = 0, count = 0, minX = 1e9, maxX = -1, minY = 1e9, maxY = -1;
     const profile = new Array(PROF).fill(0);
     const pScale = PROF / W;
@@ -216,9 +224,10 @@ const Vision = (function () {
       }
     }
     prevGray = gray;
-    if (count < 3) return null;                  // 幾乎沒有移動
     const scaleX = canvas.width / W, scaleY = canvas.height / H;
-    const out = { x: 0, y: 0, count, coverage: count / n, shift: { dx, dy }, box: null, profile };
+    const out = { x: 0, y: 0, count, coverage: count / n, shift: { dx, dy }, shake, box: null, profile };
+    // count 很低＝畫面幾乎沒動（穩定），仍回傳物件讓穩定度指示器能顯示
+    if (count < 3) return out;
     if (count >= 8) {
       out.x = (sx / count) * scaleX;
       out.y = (sy / count) * scaleY;

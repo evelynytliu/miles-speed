@@ -7,6 +7,7 @@
   const camCover = $('#camCover'), coverText = $('#coverText'), coverEmoji = $('#coverEmoji');
   const countdownEl = $('#countdown');
   const tapCatcher = $('#tapCatcher'), tapText = $('#tapText');
+  const stabilityEl = $('#stability');
 
   Vision.init(video, overlay);
 
@@ -23,6 +24,7 @@
     overlayLog: [], recStart: 0, lastLog: [],
     stripMin: 18, flash: null, armAt: 0,
     kickMode: 'manual',   // 'manual' = 點按計時（手持也準）；'auto' = 自動偵測（需放穩）
+    shakeEMA: 0,
     liveSpeed: 0,
     onMeasure: null,      // (kmh, dt) => void
     visionMode: 'pose',
@@ -137,8 +139,23 @@
     let s = 0; for (let i = lo; i <= hi; i++) s += profile[i];
     return s;
   }
+  // 穩定度指示器（依整張畫面的晃動量）
+  const TH_OK = 0.020, TH_BAD = 0.055;
+  function updateStability(shake) {
+    state.shakeEMA = state.shakeEMA * 0.8 + shake * 0.2;
+    const s = state.shakeEMA;
+    let cls, txt;
+    if (s < TH_OK) { cls = 'ok'; txt = '畫面穩定'; }
+    else if (s < TH_BAD) { cls = 'mid'; txt = '有點晃'; }
+    else { cls = 'bad'; txt = '太晃，請拿穩'; }
+    stabilityEl.className = 'pill stab ' + cls;
+    stabilityEl.innerHTML = '<span class="dot"></span>' + txt;
+    stabilityEl.hidden = false;
+  }
+
   function motionGateStep(frame, now) {
     const m = frame.extra.motion;
+    if (m && typeof m.shake === 'number') updateStability(m.shake);
     const prof = m ? m.profile : null;
     if (!prof) { liveEl.innerHTML = '<small>對準球的路線</small>'; state._aPrev = false; state._bPrev = false; return; }
 
@@ -877,6 +894,7 @@
     if (state.cdTimer) { clearTimeout(state.cdTimer); state.cdTimer = null; }
     if (Vision.isRecording()) Vision.stopRecording();
     countdownEl.hidden = true; hideTap();
+    stabilityEl.hidden = true; state.shakeEMA = 0;
     resetGate(); hideResult(); state.liveSpeed = 0; updateLive();
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
     coverEmoji.textContent = cfg.emoji;

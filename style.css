@@ -61,6 +61,13 @@ body{
 .pill.speed{font-size:20px; font-weight:700; color:var(--accent);}
 .pill.speed small{font-size:11px; font-weight:500; color:var(--muted);}
 
+.hud-stab{position:absolute; top:54px; left:0; right:0; display:flex; justify-content:center; pointer-events:none;}
+.pill.stab{font-size:13px; font-weight:600; display:flex; align-items:center; gap:7px;}
+.pill.stab .dot{width:10px; height:10px; border-radius:50%; display:inline-block;}
+.stab.ok{color:#9fe1cb;} .stab.ok .dot{background:#1d9e75;}
+.stab.mid{color:#fac775;} .stab.mid .dot{background:#ef9f27;}
+.stab.bad{color:#f7c1c1;} .stab.bad .dot{background:#e24b4a;}
+
 .hud-center{
   position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
   font-size:120px; font-weight:800; color:#fff;
