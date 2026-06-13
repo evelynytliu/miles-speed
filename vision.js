@@ -153,25 +153,61 @@ const Vision = (function () {
   function setHud(h) { hud = h || { speed: '' }; }
   function recExt() { return (recMime || '').indexOf('mp4') >= 0 ? 'mp4' : 'webm'; }
 
-  // 影格相減：回傳移動中心、外框，以及「每個橫向位置的移動量」剖面（光閘判定用）
+  // 估計全域位移：找出讓兩張投影最吻合的平移量（補償手持晃動/平移）
+  function bestShift(cur, prev, M) {
+    let best = 0, bestErr = Infinity, err0 = Infinity;
+    const L = cur.length;
+    for (let s = -M; s <= M; s++) {
+      let err = 0, cnt = 0;
+      for (let i = 0; i < L; i++) {
+        const j = i - s;
+        if (j < 0 || j >= L) continue;
+        err += Math.abs(cur[i] - prev[j]); cnt++;
+      }
+      err /= (cnt || 1);
+      if (s === 0) err0 = err;
+      if (err < bestErr) { bestErr = err; best = s; }
+    }
+    // 只有當「平移」明顯比「不平移」吻合很多，才視為相機晃動而補償；
+    // 否則（例如只有一顆球在動的靜止畫面）保持 0，避免把移動物體當成全域位移消掉
+    if (bestErr > err0 * 0.85) return 0;
+    return best;
+  }
+
+  // 影格相減（先補償全域晃動）：回傳移動中心、外框、橫向移動剖面、覆蓋率
   const PROF = 64;
+  const SHIFT_X = 8, SHIFT_Y = 6;
   function motionCentroid() {
     sctx.drawImage(video, 0, 0, small.width, small.height);
     const img = sctx.getImageData(0, 0, small.width, small.height).data;
-    const n = small.width * small.height;
+    const W = small.width, H = small.height, n = W * H;
     const gray = new Uint8Array(n);
     for (let i = 0; i < n; i++) {
       gray[i] = (img[i * 4] * 0.3 + img[i * 4 + 1] * 0.59 + img[i * 4 + 2] * 0.11) | 0;
     }
     if (!prevGray) { prevGray = gray; return null; }
 
+    // 用行/列投影估計整張畫面平移了多少（= 相機晃動），等下扣掉
+    const colG = new Float64Array(W), colP = new Float64Array(W);
+    const rowG = new Float64Array(H), rowP = new Float64Array(H);
+    for (let y = 0; y < H; y++) {
+      for (let x = 0; x < W; x++) {
+        const i = y * W + x, g = gray[i], p = prevGray[i];
+        colG[x] += g; colP[x] += p; rowG[y] += g; rowP[y] += p;
+      }
+    }
+    const dx = bestShift(colG, colP, SHIFT_X);
+    const dy = bestShift(rowG, rowP, SHIFT_Y);
+
     let sx = 0, sy = 0, count = 0, minX = 1e9, maxX = -1, minY = 1e9, maxY = -1;
     const profile = new Array(PROF).fill(0);
-    const pScale = PROF / small.width;
-    for (let y = 0; y < small.height; y++) {
-      for (let x = 0; x < small.width; x++) {
-        const i = y * small.width + x;
-        if (Math.abs(gray[i] - prevGray[i]) > motionThreshold) {
+    const pScale = PROF / W;
+    // 補償晃動後比對：gray[x,y] 對到 prevGray[x-dx, y-dy]
+    for (let y = 0; y < H; y++) {
+      const py = y - dy; if (py < 0 || py >= H) continue;
+      for (let x = 0; x < W; x++) {
+        const px = x - dx; if (px < 0 || px >= W) continue;
+        if (Math.abs(gray[y * W + x] - prevGray[py * W + px]) > motionThreshold) {
           sx += x; sy += y; count++;
           profile[(x * pScale) | 0]++;
           if (x < minX) minX = x; if (x > maxX) maxX = x;
@@ -181,8 +217,8 @@ const Vision = (function () {
     }
     prevGray = gray;
     if (count < 3) return null;                  // 幾乎沒有移動
-    const scaleX = canvas.width / small.width, scaleY = canvas.height / small.height;
-    const out = { x: 0, y: 0, count, box: null, profile };
+    const scaleX = canvas.width / W, scaleY = canvas.height / H;
+    const out = { x: 0, y: 0, count, coverage: count / n, shift: { dx, dy }, box: null, profile };
     if (count >= 8) {
       out.x = (sx / count) * scaleX;
       out.y = (sy / count) * scaleY;

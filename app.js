@@ -6,6 +6,7 @@
   const panel = $('#panel'), resultEl = $('#result');
   const camCover = $('#camCover'), coverText = $('#coverText'), coverEmoji = $('#coverEmoji');
   const countdownEl = $('#countdown');
+  const tapCatcher = $('#tapCatcher'), tapText = $('#tapText');
 
   Vision.init(video, overlay);
 
@@ -20,7 +21,8 @@
     counting: false, cdTimer: null,
     record: true,
     overlayLog: [], recStart: 0, lastLog: [],
-    stripMin: 14, flash: null,
+    stripMin: 18, flash: null, armAt: 0,
+    kickMode: 'manual',   // 'manual' = 點按計時（手持也準）；'auto' = 自動偵測（需放穩）
     liveSpeed: 0,
     onMeasure: null,      // (kmh, dt) => void
     visionMode: 'pose',
@@ -63,6 +65,7 @@
 
   function arm() {
     state.phase = 'armed'; state.t1 = 0; state.prevFrac = null; state.prevFracTime = 0;
+    state.armAt = performance.now(); state._aPrev = false; state._bPrev = false;
     hideResult(); setStatus('就位…等待通過'); updateActionBtn();
     if (state.record && Vision.isLive() && !Vision.isRecording()) {
       if (Vision.startRecording()) { state.recStart = performance.now(); state.overlayLog = []; }
@@ -121,8 +124,11 @@
     state.prevFracTime = now;
   }
 
-  // 光閘：只看兩條線上的移動量，球穿過 A→B（或 B→A）的時間就是球速
-  const STRIP_HALF = 0.05;   // 線兩側各取 5% 寬當感應帶
+  // 光閘（抗手持晃動版）：只在「某條線上的移動明顯突出於畫面平均」時才算有東西通過
+  const STRIP_HALF = 0.06;    // 線兩側各取 6% 寬當感應帶
+  const ARM_GRACE = 800;      // 按下後先給 0.8 秒穩住手機，不判定
+  const PEAK_RATIO = 2.4;     // 線上移動量要比畫面平均突出這麼多倍
+  const BUSY_COVER = 0.30;    // 整個畫面動超過 30% = 大晃動/平移 → 暫停判定
   function motionAt(profile, frac) {
     if (!profile) return 0;
     const n = profile.length;
@@ -134,21 +140,30 @@
   function motionGateStep(frame, now) {
     const m = frame.extra.motion;
     const prof = m ? m.profile : null;
-    const aNow = motionAt(prof, state.gateA);
-    const bNow = motionAt(prof, state.gateB);
+    if (!prof) { liveEl.innerHTML = '<small>對準球的路線</small>'; state._aPrev = false; state._bPrev = false; return; }
+
+    const PROF = prof.length;
+    const busy = (m.coverage || 0) > BUSY_COVER;              // 防線 2：大晃動暫停
+    const avgBucket = m.count / PROF;
+    const nStrip = Math.max(1, Math.round(STRIP_HALF * 2 * PROF));
     const TH = state.stripMin;
+    // 防線 1：線上移動量要「突出」於畫面平均，才算真的有東西通過（手晃是均勻的，會被擋掉）
+    const aSum = motionAt(prof, state.gateA), bSum = motionAt(prof, state.gateB);
+    const aActive = !busy && aSum >= TH && (aSum / nStrip) >= PEAK_RATIO * avgBucket;
+    const bActive = !busy && bSum >= TH && (bSum / nStrip) >= PEAK_RATIO * avgBucket;
 
-    // 偵測回饋：有看到移動量就顯示，方便對位/調靈敏度
-    const seen = Math.max(aNow, bNow);
-    liveEl.innerHTML = seen >= TH
-      ? '<span style="color:var(--accent)">● 偵測到</span>'
-      : (m ? '· 有微動 ·' : '<small>對準球的路線</small>');
+    // 即時回饋
+    liveEl.innerHTML = busy ? '<span style="color:var(--bad)">✋ 拿穩一點</span>'
+      : (aActive || bActive) ? '<span style="color:var(--accent)">● 偵測到</span>'
+      : '<small>對準球的路線</small>';
 
-    if (state.phase !== 'armed' && state.phase !== 'timing') { state._aPrev = aNow; state._bPrev = bNow; return; }
+    const armedOrTiming = state.phase === 'armed' || state.phase === 'timing';
+    const grace = now - state.armAt < ARM_GRACE;             // 防線 3：剛按下不判定
+    if (!armedOrTiming || grace) { state._aPrev = aActive; state._bPrev = bActive; return; }
 
-    const aRise = aNow >= TH && (state._aPrev || 0) < TH;   // 上升緣＝有東西「剛通過」這條線
-    const bRise = bNow >= TH && (state._bPrev || 0) < TH;
-    state._aPrev = aNow; state._bPrev = bNow;
+    const aRise = aActive && !state._aPrev;                  // 局部移動「剛出現」在這條線
+    const bRise = bActive && !state._bPrev;
+    state._aPrev = aActive; state._bPrev = bActive;
 
     if (state.phase === 'armed') {
       if (aRise || bRise) {
@@ -162,8 +177,8 @@
       const finished = state.firstIsA ? bRise : aRise;
       if (finished) {
         const sec = (now - state.t1) / 1000;
-        if (sec >= 0.02 && sec <= 2.5) { flashGate(state.firstIsA ? state.gateB : state.gateA); state.phase = 'done'; complete(sec); }
-        else if (sec > 2.5) { arm(); }   // 太慢，大概是誤觸，重新就位
+        if (sec >= 0.05 && sec <= 1.8) { flashGate(state.firstIsA ? state.gateB : state.gateA); state.phase = 'done'; complete(sec); }
+        else if (sec > 1.8) { arm(); }   // 太慢，大概是誤觸，重新就位
       } else if (now - state.t1 > 4000) {
         arm();
       }
@@ -189,34 +204,67 @@
   // ---------- 開始 / 停止流程（主按鈕）----------
   function labelForMode() {
     if (state.mode === 'run') return '🏁 開始計時';
-    if (state.mode === 'kick') return '⚽️ 準備踢球';
+    if (state.mode === 'kick') return state.kickMode === 'manual' ? '👆 開始點按計時' : '⚽️ 準備踢球';
     if (state.mode === 'race') return '🏁 ' + race.players[race.cur].name + ' 開始';
     return '開始';
   }
+  function isActive() {
+    return state.counting || ['armed', 'timing', 'manual1', 'manual2'].indexOf(state.phase) >= 0;
+  }
   function updateActionBtn() {
     const b = document.querySelector('#goBtn'); if (!b) return;
-    const active = state.counting || state.phase === 'armed' || state.phase === 'timing';
-    if (active) { b.textContent = '■ 停止／重來'; b.classList.add('stop'); b.onclick = stopFlow; }
+    if (isActive()) { b.textContent = '■ 停止／重來'; b.classList.add('stop'); b.onclick = stopFlow; }
     else { b.textContent = labelForMode(); b.classList.remove('stop'); b.onclick = startFlow; }
   }
   async function startFlow() {
-    if (!Vision.isLive()) { await openCamera(); if (!Vision.isLive()) return; }
+    const manualKick = state.mode === 'kick' && state.kickMode === 'manual';
+    if (!Vision.isLive()) { await openCamera(); if (!Vision.isLive() && !manualKick) return; }
     hideResult();
-    if (state.mode === 'kick') { arm(); setStatus('就位…踢出球吧！'); }
-    else {
-      state.counting = true; updateActionBtn();
-      countdown(3, () => { state.counting = false; arm(); });
-    }
+    if (manualKick) { startManual(); return; }
+    if (state.mode === 'kick') { arm(); setStatus('就位…踢出球吧！'); return; }
+    // 跑步 / 比賽：倒數後就位
+    state.counting = true; updateActionBtn();
+    countdown(3, () => { state.counting = false; arm(); });
   }
+  function manualEntry() { if (!Vision.isLive()) openCamera().then(startManual); else startManual(); }
   function stopFlow() {
     state.counting = false;
     if (state.cdTimer) { clearTimeout(state.cdTimer); state.cdTimer = null; }
     countdownEl.hidden = true;
+    hideTap();
     if (Vision.isRecording()) Vision.stopRecording();   // 取消這次錄影
     resetGate();
     state.liveSpeed = 0; updateLive();
     setStatus('已就緒，按開始');
   }
+
+  // ---------- 手動點按計時（手持也準：球過一條線點一下、過另一條再點）----------
+  function startManual() {
+    hideResult();
+    state.phase = 'manual1'; state.armAt = performance.now();
+    if (state.record && Vision.isLive() && !Vision.isRecording()) {
+      if (Vision.startRecording()) { state.recStart = performance.now(); state.overlayLog = []; }
+    }
+    updateActionBtn();
+    showTap('① 球過綠線時點一下');
+    setStatus('球過綠線時點畫面');
+  }
+  function showTap(txt) { tapText.textContent = txt; tapCatcher.hidden = false; }
+  function hideTap() { tapCatcher.hidden = true; }
+  function onTap() {
+    const now = performance.now();
+    if (state.phase === 'manual1') {
+      if (now - state.armAt < 150) return;
+      state.t1 = now; flashGate(state.gateA);
+      if (navigator.vibrate) navigator.vibrate(25);
+      state.phase = 'manual2'; showTap('② 球過紅線時再點一下'); setStatus('計時中…');
+    } else if (state.phase === 'manual2') {
+      const sec = (now - state.t1) / 1000;
+      if (sec < 0.05) return;
+      flashGate(state.gateB); hideTap(); state.phase = 'done'; complete(sec);
+    }
+  }
+  tapCatcher.onclick = onTap;
 
   // ---------- 畫面繪製（線、追蹤點、骨架）----------
   function drawScene(frame) {
@@ -515,7 +563,7 @@
       ${recordToggle()}`;
     wireDistance(); wireRecord();
     updateActionBtn();
-    $('#manualBtn').onclick = manualTimer;
+    $('#manualBtn').onclick = manualEntry;
   }
 
   // ====================================================================
@@ -748,28 +796,39 @@
       celebrate(kmh, best, 'kick', blob);
       setStatus('完成！按「再踢一球」');
     };
-    panel.innerHTML = distanceControl() + `
-      <div class="row">
+    const auto = state.kickMode === 'auto';
+    panel.innerHTML = `
+      <div class="seg">
+        <button class="seg-btn ${auto ? '' : 'active'}" data-km="manual">👆 點按計時</button>
+        <button class="seg-btn ${auto ? 'active' : ''}" data-km="auto">📷 自動偵測</button>
+      </div>
+      ${distanceControl()}
+      ${auto ? `<div class="row">
         <label>靈敏度</label>
         <input type="range" id="sens" min="6" max="40" step="2" value="${46 - state.stripMin}">
         <span class="val" id="sensV">中</span>
-      </div>
+      </div>` : ''}
       <div class="btn-row">
-        <button class="big" id="goBtn">⚽️ 準備踢球</button>
-        <button class="secondary" id="manualBtn">手動</button>
+        <button class="big" id="goBtn">${auto ? '⚽️ 準備踢球' : '👆 開始點按計時'}</button>
       </div>
-      <p class="hint">手機架在<b>側面</b>對準球的路線，把綠線/紅線拖到球會經過的地方。球穿過兩條線就會測速。背景單純、亮色球最準；測不到就把靈敏度調高。</p>
+      <p class="hint">${auto
+        ? '把手機<b>放穩</b>（靠著東西、別手持），對準球的路線；綠線/紅線拖到球會經過的地方，球穿過就自動測速。會晃就改用「點按計時」。'
+        : '手持也可以！把綠線、紅線對準球會經過的兩點，按開始後：<b>球到綠線點一下、到紅線再點一下</b>，就會算出球速。'}</p>
       ${recordToggle()}`;
     wireDistance(); wireRecord();
-    const sens = $('#sens'), sensV = $('#sensV');
-    const applySens = () => {
-      state.stripMin = 46 - +sens.value;   // 滑桿往右＝更敏感＝門檻更低
-      sensV.textContent = +sens.value > 30 ? '高' : (+sens.value < 16 ? '低' : '中');
-    };
-    sens.oninput = applySens; applySens();
-    Vision.setSensitivity(22);
+    if (auto) {
+      const sens = $('#sens'), sensV = $('#sensV');
+      const applySens = () => {
+        state.stripMin = 46 - +sens.value;
+        sensV.textContent = +sens.value > 30 ? '高' : (+sens.value < 16 ? '低' : '中');
+      };
+      sens.oninput = applySens; applySens();
+      Vision.setSensitivity(22);
+    }
     updateActionBtn();
-    $('#manualBtn').onclick = manualTimer;
+    panel.querySelectorAll('.seg-btn').forEach(btn => {
+      btn.onclick = () => { state.kickMode = btn.dataset.km; mountKick(); };
+    });
   }
 
   // ---------- 共用：距離控制 ----------
@@ -789,23 +848,6 @@
   }
   function wireRecord() {
     const c = $('#recChk'); if (c) c.onchange = () => { state.record = c.checked; };
-  }
-
-  // ---------- 手動計時（無鏡頭備案）----------
-  function manualTimer() {
-    let t0 = 0, on = false;
-    setStatus('手動計時：點畫面開始，再點一次停止');
-    const handler = () => {
-      if (!on) { t0 = performance.now(); on = true; setStatus('計時中…再點一次停止'); }
-      else {
-        on = false; overlay.removeEventListener('pointerdown', handler);
-        const sec = (performance.now() - t0) / 1000;
-        const kmh = state.distance / sec * 3.6;
-        const best = checkBest(state.mode, kmh);
-        celebrate(kmh, best, state.mode);
-      }
-    };
-    overlay.addEventListener('pointerdown', handler);
   }
 
   // ---------- 鏡頭開啟 ----------
@@ -834,7 +876,7 @@
     state.counting = false;
     if (state.cdTimer) { clearTimeout(state.cdTimer); state.cdTimer = null; }
     if (Vision.isRecording()) Vision.stopRecording();
-    countdownEl.hidden = true;
+    countdownEl.hidden = true; hideTap();
     resetGate(); hideResult(); state.liveSpeed = 0; updateLive();
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
     coverEmoji.textContent = cfg.emoji;

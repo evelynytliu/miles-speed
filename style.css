@@ -67,6 +67,26 @@ body{
   text-shadow:0 4px 30px rgba(0,0,0,.6); pointer-events:none;
 }
 
+.tap-catcher{
+  position:absolute; inset:0; z-index:5; border:none; cursor:pointer;
+  background:rgba(13,17,23,.18); color:#fff;
+  display:flex; align-items:flex-end; justify-content:center; padding-bottom:30px;
+}
+.tap-catcher[hidden]{display:none;}
+.tap-catcher #tapText{
+  background:rgba(13,17,23,.7); border:1px solid rgba(255,255,255,.2);
+  padding:14px 22px; border-radius:99px; font-size:18px; font-weight:700;
+}
+.tap-catcher:active{background:rgba(255,255,255,.12);}
+
+/* 分段切換（踢球：手動/自動）*/
+.seg{display:flex; gap:6px; background:var(--surface-2); padding:4px; border-radius:14px; margin-bottom:12px;}
+.seg-btn{
+  flex:1; border:none; background:transparent; color:var(--muted);
+  padding:10px; border-radius:10px; font-size:14px; font-weight:600; cursor:pointer;
+}
+.seg-btn.active{background:var(--accent); color:#fff;}
+
 .cam-cover{
   position:absolute; inset:0; display:flex; align-items:center; justify-content:center;
   background:radial-gradient(120% 120% at 50% 30%, #1a222d 0%, #0d1117 100%);
