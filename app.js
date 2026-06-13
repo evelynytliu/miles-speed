@@ -507,13 +507,109 @@
       <div style="font-size:24px;font-weight:800;color:${state.accent};margin-top:4px;">${win.emoji} ${win.name} 贏了！</div>
       <div class="result-sub">快了 ${diff.toFixed(2)} 秒 · 最高 ${maxKmh.toFixed(1)} km/h</div>
       <div class="replay" id="replay"></div>
+      <div class="sbs-slot" id="sbsSlot"></div>
       <div class="race-clips" id="raceClips"></div>
     </div>`);
     animateReplay(a, b);
+    attachSbs(a, b);
     attachRaceClips();
     confetti();
     speak(win.name + ' 贏了！快了 ' + diff.toFixed(1) + ' 秒');
   }
+  function attachSbs(a, b) {
+    const slot = $('#sbsSlot'); if (!slot) return;
+    if (!a.blob || !b.blob) return;   // 有一邊沒錄到就不提供並排
+    slot.innerHTML = `
+      <button class="big" id="saveSbs">🏁 存並排對比影片（特效）</button>
+      <p class="replay-note">把 ${race.players[0].name} 和 ${race.players[1].name} 兩段影片左右並排成一支對比影片（製作需幾秒）。</p>`;
+    let sbsBlob = null;
+    $('#saveSbs').onclick = async () => {
+      const btn = $('#saveSbs');
+      if (sbsBlob) { saveVideo(sbsBlob, `miles-比賽並排.${extFromMime(sbsBlob.type)}`); return; }
+      btn.disabled = true; btn.textContent = '🏁 製作中…';
+      const p0 = { blob: a.blob, log: a.log || [], name: race.players[0].name, emoji: race.players[0].emoji, sec: a.sec, kmh: a.kmh, accent: '#d85a30' };
+      const p1 = { blob: b.blob, log: b.log || [], name: race.players[1].name, emoji: race.players[1].emoji, sec: b.sec, kmh: b.kmh, accent: '#378add' };
+      sbsBlob = await renderSideBySideClip(p0, p1);
+      btn.disabled = false;
+      if (!sbsBlob) { btn.textContent = '🏁 製作失敗'; return; }
+      btn.textContent = '🏁 存並排對比影片（特效）';
+      let pv = slot.querySelector('.replay-video');
+      if (!pv) {
+        pv = document.createElement('video');
+        pv.className = 'replay-video'; pv.playsInline = true; pv.muted = true; pv.loop = true; pv.autoplay = true; pv.controls = true;
+        slot.insertBefore(pv, slot.firstChild);
+      }
+      pv.src = URL.createObjectURL(sbsBlob); pv.play();
+      saveVideo(sbsBlob, `miles-比賽並排.${extFromMime(sbsBlob.type)}`);
+    };
+  }
+
+  // 把兩段影片左右並排合成一支（事後背景處理）
+  function mkVid(src) { const v = document.createElement('video'); v.src = src; v.muted = true; v.playsInline = true; return v; }
+  function renderSideBySideClip(p0, p1) {
+    return new Promise((resolve) => {
+      if (!window.MediaRecorder) return resolve(null);
+      const u0 = URL.createObjectURL(p0.blob), u1 = URL.createObjectURL(p1.blob);
+      const v0 = mkVid(u0), v1 = mkVid(u1);
+      let done = false, ready = 0, stopping = false, iv = null;
+      const cleanup = () => { URL.revokeObjectURL(u0); URL.revokeObjectURL(u1); };
+      const fail = () => { if (!done) { done = true; if (iv) clearInterval(iv); cleanup(); resolve(null); } };
+      setTimeout(() => { if (!done) fail(); }, 45000);
+      v0.onerror = fail; v1.onerror = fail;
+      v0.onloadedmetadata = onMeta; v1.onloadedmetadata = onMeta;
+      function onMeta() { if (++ready === 2) start(); }
+
+      function start() {
+        const cellW = 640, cellH = 360, W = cellW * 2, H = cellH;
+        const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+        const cx = cv.getContext('2d');
+        const stream = cv.captureStream(30);
+        const mime = fxMime();
+        let rec;
+        try { rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 8000000 } : undefined); }
+        catch (e) { try { rec = new MediaRecorder(stream); } catch (e2) { return fail(); } }
+        const chunks = [];
+        rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+        rec.onstop = () => { if (done) return; done = true; cleanup(); resolve(chunks.length ? new Blob(chunks, { type: mime || 'video/webm' }) : null); };
+        const winner = p0.sec <= p1.sec ? 0 : 1;
+
+        function drawCell(v, p, cellX, isWin) {
+          cx.fillStyle = '#000'; cx.fillRect(cellX, 0, cellW, cellH);
+          const vw = v.videoWidth || 640, vh = v.videoHeight || 360;
+          const s = Math.min(cellW / vw, cellH / vh);
+          const dw = vw * s, dh = vh * s, ox = cellX + (cellW - dw) / 2, oy = (cellH - dh) / 2;
+          cx.save();
+          cx.beginPath(); cx.rect(cellX, 0, cellW, cellH); cx.clip();
+          cx.translate(ox, oy); cx.scale(s, s);
+          try { cx.drawImage(v, 0, 0, vw, vh); } catch (e) {}
+          const snap = nearestSnap(p.log, v.currentTime * 1000);
+          if (snap) paintOverlay(cx, vw, vh, snap, p.accent, snap.speed || '');
+          cx.restore();
+          cx.font = '600 26px sans-serif'; cx.textAlign = 'left';
+          const label = `${p.emoji} ${p.name}  ${p.sec.toFixed(2)}s`;
+          const tw = cx.measureText(label).width;
+          cx.fillStyle = 'rgba(0,0,0,.55)'; cx.fillRect(cellX + 12, 12, tw + (isWin ? 46 : 20), 38);
+          cx.fillStyle = '#fff'; cx.fillText(label, cellX + 22, 38);
+          if (isWin) cx.fillText('👑', cellX + 22 + tw + 6, 38);
+        }
+        function tick() {
+          if (done) return;
+          drawCell(v0, p0, 0, winner === 0);
+          drawCell(v1, p1, cellW, winner === 1);
+          cx.strokeStyle = 'rgba(255,255,255,.6)'; cx.lineWidth = 3;
+          cx.beginPath(); cx.moveTo(cellW, 0); cx.lineTo(cellW, H); cx.stroke();
+          if (!stopping && v0.ended && v1.ended) {
+            stopping = true;
+            setTimeout(() => { if (iv) clearInterval(iv); try { rec.stop(); } catch (e) {} }, 250);
+          }
+        }
+        rec.start();
+        iv = setInterval(tick, 33);
+        v0.play().catch(() => {}); v1.play().catch(() => {});
+      }
+    });
+  }
+
   function attachRaceClips() {
     const box = $('#raceClips'); if (!box) return;
     box.innerHTML = race.players.map((p, i) => race.results[i] && race.results[i].blob ? `

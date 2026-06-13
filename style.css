@@ -155,6 +155,8 @@ button[disabled]{opacity:.45; pointer-events:none;}
 .save-opts .big{flex:1;}
 .replay-video{width:100%; border-radius:14px; background:#000; display:block; margin-bottom:10px; border:1px solid var(--line);}
 .replay-note{font-size:13px; color:var(--muted); text-align:center;}
+.sbs-slot{margin-top:14px;}
+.sbs-slot .big{width:100%;}
 .race-clips{display:flex; gap:10px; margin-top:14px;}
 .clip-card{flex:1; min-width:0;}
 .clip-head{font-size:13px; color:var(--muted); margin-bottom:6px; text-align:center;}
