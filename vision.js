@@ -109,7 +109,10 @@ const Vision = (function () {
       busy = false;
     } else if (mode === 'motion' && video.videoWidth) {
       const m = motionCentroid();
-      if (m) { point = { x: m.x, y: m.y }; valid = true; extra.motion = m; }
+      if (m) {
+        extra.motion = m;                    // 一定帶 profile（光閘判定用）
+        if (m.count >= 12 && m.box) { point = { x: m.x, y: m.y }; valid = true; }
+      }
     }
 
     if (onFrame) onFrame({ ctx, w: canvas.width, h: canvas.height, point, valid, extra, dt: (now - lastTime) / 1000 });
@@ -150,7 +153,8 @@ const Vision = (function () {
   function setHud(h) { hud = h || { speed: '' }; }
   function recExt() { return (recMime || '').indexOf('mp4') >= 0 ? 'mp4' : 'webm'; }
 
-  // 影格相減找出移動最劇烈的區塊中心（追球用）
+  // 影格相減：回傳移動中心、外框，以及「每個橫向位置的移動量」剖面（光閘判定用）
+  const PROF = 64;
   function motionCentroid() {
     sctx.drawImage(video, 0, 0, small.width, small.height);
     const img = sctx.getImageData(0, 0, small.width, small.height).data;
@@ -162,25 +166,29 @@ const Vision = (function () {
     if (!prevGray) { prevGray = gray; return null; }
 
     let sx = 0, sy = 0, count = 0, minX = 1e9, maxX = -1, minY = 1e9, maxY = -1;
+    const profile = new Array(PROF).fill(0);
+    const pScale = PROF / small.width;
     for (let y = 0; y < small.height; y++) {
       for (let x = 0; x < small.width; x++) {
         const i = y * small.width + x;
         if (Math.abs(gray[i] - prevGray[i]) > motionThreshold) {
           sx += x; sy += y; count++;
+          profile[(x * pScale) | 0]++;
           if (x < minX) minX = x; if (x > maxX) maxX = x;
           if (y < minY) minY = y; if (y > maxY) maxY = y;
         }
       }
     }
     prevGray = gray;
-    if (count < 12) return null;                 // 太少 = 沒有明顯移動
+    if (count < 3) return null;                  // 幾乎沒有移動
     const scaleX = canvas.width / small.width, scaleY = canvas.height / small.height;
-    return {
-      x: (sx / count) * scaleX,
-      y: (sy / count) * scaleY,
-      count,
-      box: { x: minX * scaleX, y: minY * scaleY, w: (maxX - minX) * scaleX, h: (maxY - minY) * scaleY }
-    };
+    const out = { x: 0, y: 0, count, box: null, profile };
+    if (count >= 8) {
+      out.x = (sx / count) * scaleX;
+      out.y = (sy / count) * scaleY;
+      out.box = { x: minX * scaleX, y: minY * scaleY, w: (maxX - minX) * scaleX, h: (maxY - minY) * scaleY };
+    }
+    return out;
   }
 
   // 骨架連線（給跑步畫面用）

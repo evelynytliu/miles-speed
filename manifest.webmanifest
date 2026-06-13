@@ -1,7 +1,7 @@
 {
-  "name": "Miles 速度王",
+  "name": "速度王 SpeedStar",
   "short_name": "速度王",
-  "description": "看你跑多快、跟姊姊比賽、測你踢球多快！",
+  "description": "看你跑多快、和朋友比賽、測你踢球多快！",
   "start_url": "./index.html",
   "display": "standalone",
   "orientation": "any",

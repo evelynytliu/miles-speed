@@ -20,6 +20,7 @@
     counting: false, cdTimer: null,
     record: true,
     overlayLog: [], recStart: 0, lastLog: [],
+    stripMin: 14, flash: null,
     liveSpeed: 0,
     onMeasure: null,      // (kmh, dt) => void
     visionMode: 'pose',
@@ -74,6 +75,9 @@
     drawScene(frame);
     const now = performance.now();
 
+    // 踢球：用「光閘」判定（只看起終點線上的移動量），抗旁邊有人在動
+    if (state.visionMode === 'motion') { motionGateStep(frame, now); return; }
+
     if (!valid || !point) {
       // 影格之間相機可能還沒更新 → 暫時保留上一個位置，超過 HOLD_MS 才清空
       if (state.prevFrac != null && now - state.prevFracTime > HOLD_MS) state.prevFrac = null;
@@ -116,6 +120,56 @@
     state.prevFrac = frac;
     state.prevFracTime = now;
   }
+
+  // 光閘：只看兩條線上的移動量，球穿過 A→B（或 B→A）的時間就是球速
+  const STRIP_HALF = 0.05;   // 線兩側各取 5% 寬當感應帶
+  function motionAt(profile, frac) {
+    if (!profile) return 0;
+    const n = profile.length;
+    const lo = Math.max(0, Math.floor((frac - STRIP_HALF) * n));
+    const hi = Math.min(n - 1, Math.ceil((frac + STRIP_HALF) * n));
+    let s = 0; for (let i = lo; i <= hi; i++) s += profile[i];
+    return s;
+  }
+  function motionGateStep(frame, now) {
+    const m = frame.extra.motion;
+    const prof = m ? m.profile : null;
+    const aNow = motionAt(prof, state.gateA);
+    const bNow = motionAt(prof, state.gateB);
+    const TH = state.stripMin;
+
+    // 偵測回饋：有看到移動量就顯示，方便對位/調靈敏度
+    const seen = Math.max(aNow, bNow);
+    liveEl.innerHTML = seen >= TH
+      ? '<span style="color:var(--accent)">● 偵測到</span>'
+      : (m ? '· 有微動 ·' : '<small>對準球的路線</small>');
+
+    if (state.phase !== 'armed' && state.phase !== 'timing') { state._aPrev = aNow; state._bPrev = bNow; return; }
+
+    const aRise = aNow >= TH && (state._aPrev || 0) < TH;   // 上升緣＝有東西「剛通過」這條線
+    const bRise = bNow >= TH && (state._bPrev || 0) < TH;
+    state._aPrev = aNow; state._bPrev = bNow;
+
+    if (state.phase === 'armed') {
+      if (aRise || bRise) {
+        state.phase = 'timing'; state.t1 = now;
+        state.firstIsA = aRise && !bRise ? true : (bRise && !aRise ? false : true);
+        flashGate(state.firstIsA ? state.gateA : state.gateB);
+        if (navigator.vibrate) navigator.vibrate(20);
+        setStatus('偵測到！計時中…'); updateActionBtn();
+      }
+    } else if (state.phase === 'timing') {
+      const finished = state.firstIsA ? bRise : aRise;
+      if (finished) {
+        const sec = (now - state.t1) / 1000;
+        if (sec >= 0.02 && sec <= 2.5) { flashGate(state.firstIsA ? state.gateB : state.gateA); state.phase = 'done'; complete(sec); }
+        else if (sec > 2.5) { arm(); }   // 太慢，大概是誤觸，重新就位
+      } else if (now - state.t1 > 4000) {
+        arm();
+      }
+    }
+  }
+  function flashGate(frac) { state.flash = { frac, until: performance.now() + 220 }; }
 
   function decayLive() { state.liveSpeed *= 0.9; if (state.liveSpeed < 0.3) state.liveSpeed = 0; updateLive(); }
   function updateLive() {
@@ -174,6 +228,12 @@
       box: (state.visionMode === 'motion' && extra.motion) ? extra.motion.box : null
     };
     paintOverlay(ctx, w, h, d, state.accent, '');   // 即時畫面不燒速度（用 DOM 速度牌）
+    // 光閘觸發時，線閃一下白光當回饋
+    if (state.flash && performance.now() < state.flash.until) {
+      const x = state.flash.frac * w;
+      ctx.fillStyle = 'rgba(255,255,255,.45)';
+      ctx.fillRect(x - w * STRIP_HALF, 0, w * STRIP_HALF * 2, h);
+    }
     if (state.record && Vision.isRecording()) pushSnapshot(d, w);
   }
 
@@ -295,7 +355,7 @@
     lastClipUrl = URL.createObjectURL(blob);
     const log = state.lastLog || [];
     const accent = state.accent;
-    const base = `miles-${mode}-${kmh.toFixed(0)}kmh`;
+    const base = `speed-${mode}-${kmh.toFixed(0)}kmh`;
     slot.innerHTML = `
       <video class="replay-video" src="${lastClipUrl}" playsinline muted loop autoplay controls></video>
       <div class="save-opts">
@@ -308,7 +368,7 @@
     let fxBlob = null;
     slot.querySelector('#saveFx').onclick = async () => {
       const btn = slot.querySelector('#saveFx');
-      if (fxBlob) { saveVideo(fxBlob, base + '-特效.' + extFromMime(fxBlob.type)); return; }
+      if (fxBlob) { saveVideo(fxBlob, base + '-fx.' +extFromMime(fxBlob.type)); return; }
       if (!log.length) { btn.textContent = '✨ 這次沒有特效資料'; return; }
       btn.disabled = true; btn.textContent = '✨ 製作中…';
       fxBlob = await renderEffectsClip(blob, log, accent);
@@ -318,7 +378,7 @@
       if (lastFxUrl) URL.revokeObjectURL(lastFxUrl);
       lastFxUrl = URL.createObjectURL(fxBlob);
       vEl.src = lastFxUrl; vEl.play();   // 預覽切到特效版
-      saveVideo(fxBlob, base + '-特效.' + extFromMime(fxBlob.type));
+      saveVideo(fxBlob, base + '-fx.' +extFromMime(fxBlob.type));
     };
   }
 
@@ -390,7 +450,7 @@
     try {
       const file = new File([blob], name, { type });
       if (navigator.canShare && navigator.canShare({ files: [file] })) {
-        await navigator.share({ files: [file], title: 'Miles 速度王' });
+        await navigator.share({ files: [file], title: '速度王' });
         return;
       }
     } catch (e) { if (e && e.name === 'AbortError') return; }
@@ -451,7 +511,7 @@
         <button class="big" id="goBtn">🏁 開始計時</button>
         <button class="secondary" id="manualBtn">手動</button>
       </div>
-      <p class="hint">手機架在<b>側面</b>，讓 Miles 橫向跑過畫面。拖曳綠線/紅線對準起跑與終點。</p>
+      <p class="hint">手機架在<b>側面</b>，讓小朋友橫向跑過畫面。拖曳綠線/紅線對準起跑與終點。</p>
       ${recordToggle()}`;
     wireDistance(); wireRecord();
     updateActionBtn();
@@ -461,7 +521,20 @@
   // ====================================================================
   //  模式：比賽（兩位選手輪流跑同一段）
   // ====================================================================
-  const race = { players: [{ name: 'Miles', emoji: '🟠' }, { name: '姊姊', emoji: '🔵' }], cur: 0, results: [] };
+  const PLAYERS_KEY = 'speed_players';
+  function loadPlayers() {
+    let saved = null;
+    try { saved = JSON.parse(localStorage.getItem(PLAYERS_KEY)); } catch (e) {}
+    const def = [{ name: '選手 1', emoji: '🟠' }, { name: '選手 2', emoji: '🔵' }];
+    if (saved && saved[0] && saved[1]) { def[0].name = saved[0].name || def[0].name; def[1].name = saved[1].name || def[1].name; }
+    return def;
+  }
+  function savePlayers() {
+    localStorage.setItem(PLAYERS_KEY, JSON.stringify(race.players.map(p => ({ name: p.name }))));
+  }
+  function escapeAttr(s) { return String(s).replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;').replace(/>/g, '&gt;'); }
+  function safeName(s) { return String(s).replace(/[\\/:*?"<>|\s]+/g, '') || 'player'; }
+  const race = { players: loadPlayers(), cur: 0, results: [] };
   function mountRace() {
     race.cur = 0; race.results = []; state.phase = 'idle'; state.counting = false;
     state.onMeasure = (kmh, sec, blob) => {
@@ -480,10 +553,11 @@
       <div class="players">
         ${race.players.map((p, i) => `
           <div class="player ${i === race.cur ? 'active' : ''}">
-            <div class="pname">${p.emoji} ${p.name}</div>
+            <div class="pname"><span>${p.emoji}</span><input class="name-input" data-i="${i}" value="${escapeAttr(p.name)}" maxlength="10" aria-label="選手${i + 1}名字" /></div>
             <div class="ptime">${race.results[i] ? race.results[i].sec.toFixed(2) : '--'}<small>s</small></div>
           </div>`).join('')}
       </div>
+      <p class="hint" style="margin-top:0">點上面的名字可以改成你們自己的名字 ✏️</p>
       ${distanceControl()}
       <div class="btn-row">
         <button class="big" id="goBtn">🏁 ${race.players[race.cur].name} 開始</button>
@@ -494,6 +568,15 @@
     wireDistance(); wireRecord();
     state.phase = 'idle'; state.counting = false;
     updateActionBtn();
+    panel.querySelectorAll('.name-input').forEach(inp => {
+      inp.onchange = inp.oninput = () => {
+        const i = +inp.dataset.i;
+        race.players[i].name = inp.value.trim() || ('選手 ' + (i + 1));
+        savePlayers();
+        const b = $('#goBtn');
+        if (b && !b.classList.contains('stop')) b.textContent = '🏁 ' + race.players[race.cur].name + ' 開始';
+      };
+    });
     $('#resetRace').onclick = () => { hideResult(); mountRace(); };
   }
   function finishRace() {
@@ -525,7 +608,7 @@
     let sbsBlob = null;
     $('#saveSbs').onclick = async () => {
       const btn = $('#saveSbs');
-      if (sbsBlob) { saveVideo(sbsBlob, `miles-比賽並排.${extFromMime(sbsBlob.type)}`); return; }
+      if (sbsBlob) { saveVideo(sbsBlob, `speed-race-sidebyside.${extFromMime(sbsBlob.type)}`); return; }
       btn.disabled = true; btn.textContent = '🏁 製作中…';
       const p0 = { blob: a.blob, log: a.log || [], name: race.players[0].name, emoji: race.players[0].emoji, sec: a.sec, kmh: a.kmh, accent: '#d85a30' };
       const p1 = { blob: b.blob, log: b.log || [], name: race.players[1].name, emoji: race.players[1].emoji, sec: b.sec, kmh: b.kmh, accent: '#378add' };
@@ -540,7 +623,7 @@
         slot.insertBefore(pv, slot.firstChild);
       }
       pv.src = URL.createObjectURL(sbsBlob); pv.play();
-      saveVideo(sbsBlob, `miles-比賽並排.${extFromMime(sbsBlob.type)}`);
+      saveVideo(sbsBlob, `speed-race-sidebyside.${extFromMime(sbsBlob.type)}`);
     };
   }
 
@@ -623,14 +706,14 @@
       const i = +card.querySelector('.save-leg').dataset.i;
       const r = race.results[i];
       const accent = race.players[i] === race.players[0] ? '#d85a30' : '#378add';
-      const base = `miles-race-${race.players[i].name}-${r.kmh.toFixed(0)}kmh`;
+      const base = `speed-race-${safeName(race.players[i].name)}-${r.kmh.toFixed(0)}kmh`;
       const vEl = card.querySelector('video');
       vEl.src = URL.createObjectURL(r.blob);
       card.querySelector('.save-leg').onclick = () => saveVideo(r.blob, base + '.' + Vision.recExt());
       let fx = null;
       card.querySelector('.save-fx').onclick = async (e) => {
         const btn = e.currentTarget;
-        if (fx) { saveVideo(fx, base + '-特效.' + extFromMime(fx.type)); return; }
+        if (fx) { saveVideo(fx, base + '-fx.' +extFromMime(fx.type)); return; }
         if (!r.log || !r.log.length) { btn.textContent = '✨ 沒有特效資料'; return; }
         btn.disabled = true; btn.textContent = '✨ 製作中…';
         fx = await renderEffectsClip(r.blob, r.log, accent);
@@ -638,7 +721,7 @@
         if (!fx) { btn.textContent = '✨ 製作失敗'; return; }
         btn.textContent = '✨ 存特效版';
         vEl.src = URL.createObjectURL(fx); vEl.play();
-        saveVideo(fx, base + '-特效.' + extFromMime(fx.type));
+        saveVideo(fx, base + '-fx.' +extFromMime(fx.type));
       };
     });
   }
@@ -668,22 +751,23 @@
     panel.innerHTML = distanceControl() + `
       <div class="row">
         <label>靈敏度</label>
-        <input type="range" id="sens" min="12" max="50" step="2" value="28">
+        <input type="range" id="sens" min="6" max="40" step="2" value="${46 - state.stripMin}">
         <span class="val" id="sensV">中</span>
       </div>
       <div class="btn-row">
         <button class="big" id="goBtn">⚽️ 準備踢球</button>
         <button class="secondary" id="manualBtn">手動</button>
       </div>
-      <p class="hint">手機架在<b>側面</b>對準球的路線，球飛過兩條線就會測出球速。背景單純、亮色球最準。</p>
+      <p class="hint">手機架在<b>側面</b>對準球的路線，把綠線/紅線拖到球會經過的地方。球穿過兩條線就會測速。背景單純、亮色球最準；測不到就把靈敏度調高。</p>
       ${recordToggle()}`;
     wireDistance(); wireRecord();
     const sens = $('#sens'), sensV = $('#sensV');
-    sens.oninput = () => {
-      Vision.setSensitivity(+sens.value);
-      sensV.textContent = +sens.value < 22 ? '高' : (+sens.value > 38 ? '低' : '中');
+    const applySens = () => {
+      state.stripMin = 46 - +sens.value;   // 滑桿往右＝更敏感＝門檻更低
+      sensV.textContent = +sens.value > 30 ? '高' : (+sens.value < 16 ? '低' : '中');
     };
-    Vision.setSensitivity(+sens.value);
+    sens.oninput = applySens; applySens();
+    Vision.setSensitivity(22);
     updateActionBtn();
     $('#manualBtn').onclick = manualTimer;
   }
