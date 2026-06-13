@@ -1,0 +1,18 @@
+{
+  "name": "Miles 速度王",
+  "short_name": "速度王",
+  "description": "看你跑多快、跟姊姊比賽、測你踢球多快！",
+  "start_url": "./index.html",
+  "display": "standalone",
+  "orientation": "any",
+  "background_color": "#0d1117",
+  "theme_color": "#0d1117",
+  "icons": [
+    {
+      "src": "data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 512 512'><rect width='512' height='512' rx='110' fill='%230d1117'/><text x='256' y='370' font-size='300' text-anchor='middle'>⚡️</text></svg>",
+      "sizes": "512x512",
+      "type": "image/svg+xml",
+      "purpose": "any"
+    }
+  ]
+}
