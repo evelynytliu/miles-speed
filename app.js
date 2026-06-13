@@ -19,6 +19,7 @@
     t1: 0, firstIsA: true, prevFrac: null, prevFracTime: 0,
     counting: false, cdTimer: null,
     record: true,
+    overlayLog: [], recStart: 0, lastLog: [],
     liveSpeed: 0,
     onMeasure: null,      // (kmh, dt) => void
     visionMode: 'pose',
@@ -62,7 +63,9 @@
   function arm() {
     state.phase = 'armed'; state.t1 = 0; state.prevFrac = null; state.prevFracTime = 0;
     hideResult(); setStatus('就位…等待通過'); updateActionBtn();
-    if (state.record && Vision.isLive() && !Vision.isRecording()) Vision.startRecording();
+    if (state.record && Vision.isLive() && !Vision.isRecording()) {
+      if (Vision.startRecording()) { state.recStart = performance.now(); state.overlayLog = []; }
+    }
   }
   function resetGate() { state.phase = 'idle'; state.prevFrac = null; updateActionBtn(); }
 
@@ -123,6 +126,7 @@
   function complete(sec) {
     const kmh = state.distance / sec * 3.6;
     if (navigator.vibrate) navigator.vibrate(60);
+    state.lastLog = state.overlayLog.slice();
     const finalize = (blob) => { if (state.onMeasure) state.onMeasure(kmh, sec, blob); updateActionBtn(); };
     if (Vision.isRecording()) Vision.stopRecording().then(finalize);
     else finalize(null);
@@ -163,24 +167,52 @@
   // ---------- 畫面繪製（線、追蹤點、骨架）----------
   function drawScene(frame) {
     const { ctx, w, h, point, extra } = frame;
-    // 起點 / 終點線
-    line(ctx, state.gateA * w, h, '#5dcaa5', '起點');
-    line(ctx, state.gateB * w, h, '#f09595', '終點');
+    const d = {
+      gateA: state.gateA, gateB: state.gateB,
+      point: point ? { x: point.x, y: point.y } : null,
+      pose: (state.visionMode === 'pose' && extra.pose) ? extra.pose : null,
+      box: (state.visionMode === 'motion' && extra.motion) ? extra.motion.box : null
+    };
+    paintOverlay(ctx, w, h, d, state.accent, '');   // 即時畫面不燒速度（用 DOM 速度牌）
+    if (state.record && Vision.isRecording()) pushSnapshot(d, w);
+  }
 
-    if (state.visionMode === 'pose' && extra.pose) {
-      Vision.drawSkeleton(ctx, extra.pose, state.accent);
+  // 純繪圖：即時畫面與「事後特效合成」共用同一套，確保一致
+  function paintOverlay(ctx, w, h, d, accent, burnSpeed) {
+    line(ctx, d.gateA * w, h, '#5dcaa5', '起點');
+    line(ctx, d.gateB * w, h, '#f09595', '終點');
+    if (d.pose) Vision.drawSkeleton(ctx, d.pose, accent);
+    if (d.box) {
+      ctx.strokeStyle = accent; ctx.lineWidth = Math.max(3, w / 220);
+      ctx.strokeRect(d.box.x - 6, d.box.y - 6, d.box.w + 12, d.box.h + 12);
     }
-    if (state.visionMode === 'motion' && extra.motion && extra.motion.box) {
-      const b = extra.motion.box;
-      ctx.strokeStyle = state.accent; ctx.lineWidth = Math.max(3, w / 220);
-      ctx.strokeRect(b.x - 6, b.y - 6, b.w + 12, b.h + 12);
-    }
-    if (point) {
-      ctx.fillStyle = state.accent;
-      ctx.beginPath(); ctx.arc(point.x, point.y, Math.max(7, w / 90), 0, 7); ctx.fill();
+    if (d.point) {
+      ctx.fillStyle = accent;
+      ctx.beginPath(); ctx.arc(d.point.x, d.point.y, Math.max(7, w / 90), 0, 7); ctx.fill();
       ctx.fillStyle = '#fff';
-      ctx.beginPath(); ctx.arc(point.x, point.y, Math.max(3, w / 200), 0, 7); ctx.fill();
+      ctx.beginPath(); ctx.arc(d.point.x, d.point.y, Math.max(3, w / 200), 0, 7); ctx.fill();
     }
+    if (burnSpeed) {
+      const f = Math.max(20, w / 28);
+      ctx.font = `600 ${f}px sans-serif`; ctx.textAlign = 'right';
+      const tw = ctx.measureText(burnSpeed).width;
+      ctx.fillStyle = 'rgba(0,0,0,.5)'; ctx.fillRect(w - tw - 36, 14, tw + 26, f + 16);
+      ctx.fillStyle = '#fff'; ctx.fillText(burnSpeed, w - 24, 14 + f + 1);
+      ctx.textAlign = 'left';
+    }
+  }
+
+  // 錄影時記錄每格的疊圖資料（很小，純數字）供事後合成特效版
+  function pushSnapshot(d, w) {
+    if (state.overlayLog.length > 900) return;
+    state.overlayLog.push({
+      t: performance.now() - state.recStart,
+      gateA: d.gateA, gateB: d.gateB,
+      point: d.point ? { x: d.point.x, y: d.point.y } : null,
+      pose: d.pose ? { keypoints: d.pose.keypoints.map(k => ({ name: k.name, x: k.x, y: k.y, score: k.score })) } : null,
+      box: d.box ? { x: d.box.x, y: d.box.y, w: d.box.w, h: d.box.h } : null,
+      speed: state.liveSpeed > 0.3 ? state.liveSpeed.toFixed(1) + ' km/h' : ''
+    });
   }
   function line(ctx, x, h, color, text) {
     ctx.strokeStyle = color; ctx.lineWidth = Math.max(3, ctx.canvas.width / 240);
@@ -248,8 +280,8 @@
     attachReplay(blob, mode, kmh);
   }
 
-  // ---------- 重播 + 存到手機 ----------
-  let lastClipUrl = null;
+  // ---------- 重播 + 存到手機（特效版 / 原始版）----------
+  let lastClipUrl = null, lastFxUrl = null;
   function attachReplay(blob, mode, kmh) {
     const slot = resultEl.querySelector('.replay-slot');
     if (!slot) return;
@@ -259,17 +291,98 @@
       return;
     }
     if (lastClipUrl) URL.revokeObjectURL(lastClipUrl);
+    if (lastFxUrl) { URL.revokeObjectURL(lastFxUrl); lastFxUrl = null; }
     lastClipUrl = URL.createObjectURL(blob);
-    const name = `miles-${mode}-${kmh.toFixed(0)}kmh.${Vision.recExt()}`;
+    const log = state.lastLog || [];
+    const accent = state.accent;
+    const base = `miles-${mode}-${kmh.toFixed(0)}kmh`;
     slot.innerHTML = `
       <video class="replay-video" src="${lastClipUrl}" playsinline muted loop autoplay controls></video>
-      <div class="btn-row">
-        <button class="big" id="saveClip">💾 存到手機</button>
-        <button class="secondary" id="replayClip">🔁 重看</button>
-      </div>`;
-    const v = slot.querySelector('.replay-video');
-    slot.querySelector('#replayClip').onclick = () => { v.currentTime = 0; v.play(); };
-    slot.querySelector('#saveClip').onclick = () => saveVideo(blob, name);
+      <div class="save-opts">
+        <button class="big" id="saveFx">✨ 存特效版</button>
+        <button class="secondary" id="saveRaw">💾 存原始版</button>
+      </div>
+      <p class="replay-note">特效版會把骨架、起終點線、速度做進影片（製作需幾秒）。原始版是乾淨的鏡頭畫面。</p>`;
+    const vEl = slot.querySelector('.replay-video');
+    slot.querySelector('#saveRaw').onclick = () => saveVideo(blob, base + '.' + Vision.recExt());
+    let fxBlob = null;
+    slot.querySelector('#saveFx').onclick = async () => {
+      const btn = slot.querySelector('#saveFx');
+      if (fxBlob) { saveVideo(fxBlob, base + '-特效.' + extFromMime(fxBlob.type)); return; }
+      if (!log.length) { btn.textContent = '✨ 這次沒有特效資料'; return; }
+      btn.disabled = true; btn.textContent = '✨ 製作中…';
+      fxBlob = await renderEffectsClip(blob, log, accent);
+      btn.disabled = false;
+      if (!fxBlob) { btn.textContent = '✨ 特效製作失敗'; return; }
+      btn.textContent = '✨ 存特效版';
+      if (lastFxUrl) URL.revokeObjectURL(lastFxUrl);
+      lastFxUrl = URL.createObjectURL(fxBlob);
+      vEl.src = lastFxUrl; vEl.play();   // 預覽切到特效版
+      saveVideo(fxBlob, base + '-特效.' + extFromMime(fxBlob.type));
+    };
+  }
+
+  function extFromMime(t) { return t && t.indexOf('mp4') >= 0 ? 'mp4' : 'webm'; }
+  function fxMime() {
+    const c = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    if (!window.MediaRecorder) return '';
+    for (const m of c) { try { if (MediaRecorder.isTypeSupported(m)) return m; } catch (e) {} }
+    return '';
+  }
+  function nearestSnap(log, tMs) {
+    if (!log.length) return null;
+    let best = log[0], bd = Math.abs(log[0].t - tMs);
+    for (let i = 1; i < log.length; i++) {
+      const dd = Math.abs(log[i].t - tMs);
+      if (dd < bd) { bd = dd; best = log[i]; }
+      else if (log[i].t > tMs) break;
+    }
+    return best;
+  }
+
+  // 事後把疊圖合成進影片（用播放重新編碼，不影響即時偵測）
+  function renderEffectsClip(cleanBlob, log, accent) {
+    return new Promise((resolve) => {
+      if (!window.MediaRecorder) return resolve(null);
+      const url = URL.createObjectURL(cleanBlob);
+      const v = document.createElement('video');
+      v.src = url; v.muted = true; v.playsInline = true;
+      let done = false;
+      const fail = () => { if (!done) { done = true; URL.revokeObjectURL(url); resolve(null); } };
+      v.onerror = fail;
+      setTimeout(() => { if (!done) fail(); }, 30000);   // 安全逾時
+      v.onloadedmetadata = () => {
+        const W = v.videoWidth || 640, H = v.videoHeight || 360;
+        const cv = document.createElement('canvas'); cv.width = W; cv.height = H;
+        const cx = cv.getContext('2d');
+        const stream = cv.captureStream(30);
+        const mime = fxMime();
+        let rec;
+        try { rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 6000000 } : undefined); }
+        catch (e) { try { rec = new MediaRecorder(stream); } catch (e2) { return fail(); } }
+        const chunks = [];
+        rec.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+        rec.onstop = () => { if (done) return; done = true; URL.revokeObjectURL(url); resolve(chunks.length ? new Blob(chunks, { type: mime || 'video/webm' }) : null); };
+        const paint = () => {
+          cx.drawImage(v, 0, 0, W, H);
+          const snap = nearestSnap(log, v.currentTime * 1000);
+          if (snap) paintOverlay(cx, W, H, snap, accent, snap.speed || '');
+        };
+        const hasRVFC = 'requestVideoFrameCallback' in HTMLVideoElement.prototype;
+        let iv = null;
+        const finish = () => { paint(); setTimeout(() => { try { rec.stop(); } catch (e) {} if (iv) clearInterval(iv); }, 120); };
+        v.onended = finish;
+        rec.start();
+        v.play().then(() => {
+          if (hasRVFC) {
+            const step = () => { if (v.ended || v.paused) return; paint(); v.requestVideoFrameCallback(step); };
+            v.requestVideoFrameCallback(step);
+          } else {
+            iv = setInterval(() => { if (v.ended) return; paint(); }, 33);
+          }
+        }).catch(fail);
+      };
+    });
   }
 
   async function saveVideo(blob, name) {
@@ -352,7 +465,7 @@
   function mountRace() {
     race.cur = 0; race.results = []; state.phase = 'idle'; state.counting = false;
     state.onMeasure = (kmh, sec, blob) => {
-      race.results[race.cur] = { kmh, sec, blob };
+      race.results[race.cur] = { kmh, sec, blob, log: state.lastLog.slice() };
       if (race.cur === 0) {
         speak(race.players[0].name + ' 跑了 ' + sec.toFixed(1) + ' 秒，換 ' + race.players[1].name);
         race.cur = 1; renderRace(); setStatus(race.players[1].name + ' 準備，按開始');
@@ -407,14 +520,30 @@
       <div class="clip-card">
         <div class="clip-head">${p.emoji} ${p.name} · ${race.results[i].kmh.toFixed(1)} km/h</div>
         <video class="replay-video" playsinline muted loop autoplay controls></video>
-        <button class="secondary save-leg" data-i="${i}">💾 存到手機</button>
+        <button class="big save-fx" data-i="${i}">✨ 存特效版</button>
+        <button class="secondary save-leg" data-i="${i}">💾 存原始版</button>
       </div>` : '').join('');
     box.querySelectorAll('.clip-card').forEach((card) => {
       const i = +card.querySelector('.save-leg').dataset.i;
       const r = race.results[i];
-      const url = URL.createObjectURL(r.blob);
-      card.querySelector('video').src = url;
-      card.querySelector('.save-leg').onclick = () => saveVideo(r.blob, `miles-race-${race.players[i].name}-${r.kmh.toFixed(0)}kmh.${Vision.recExt()}`);
+      const accent = race.players[i] === race.players[0] ? '#d85a30' : '#378add';
+      const base = `miles-race-${race.players[i].name}-${r.kmh.toFixed(0)}kmh`;
+      const vEl = card.querySelector('video');
+      vEl.src = URL.createObjectURL(r.blob);
+      card.querySelector('.save-leg').onclick = () => saveVideo(r.blob, base + '.' + Vision.recExt());
+      let fx = null;
+      card.querySelector('.save-fx').onclick = async (e) => {
+        const btn = e.currentTarget;
+        if (fx) { saveVideo(fx, base + '-特效.' + extFromMime(fx.type)); return; }
+        if (!r.log || !r.log.length) { btn.textContent = '✨ 沒有特效資料'; return; }
+        btn.disabled = true; btn.textContent = '✨ 製作中…';
+        fx = await renderEffectsClip(r.blob, r.log, accent);
+        btn.disabled = false;
+        if (!fx) { btn.textContent = '✨ 製作失敗'; return; }
+        btn.textContent = '✨ 存特效版';
+        vEl.src = URL.createObjectURL(fx); vEl.play();
+        saveVideo(fx, base + '-特效.' + extFromMime(fx.type));
+      };
     });
   }
   function animateReplay(a, b) {
