@@ -16,7 +16,8 @@
     gateA: 0.30,          // 起點線（畫面寬度比例）
     gateB: 0.70,          // 終點線
     phase: 'idle',        // idle | armed | timing | done
-    t1: 0, firstIsA: true, prevFrac: null,
+    t1: 0, firstIsA: true, prevFrac: null, prevFracTime: 0,
+    counting: false, cdTimer: null,
     liveSpeed: 0,
     onMeasure: null,      // (kmh, dt) => void
     visionMode: 'pose',
@@ -55,61 +56,98 @@
   }
 
   // ---------- 計時門偵測 ----------
-  function arm() { state.phase = 'armed'; state.t1 = 0; state.prevFrac = null; hideResult(); setStatus('就位…等待通過起點線'); }
-  function resetGate() { state.phase = 'idle'; state.prevFrac = null; }
+  const HOLD_MS = 320;   // 短暫偵測不到時，保留上一個位置多久（解決相機/畫面更新不同步）
+
+  function arm() { state.phase = 'armed'; state.t1 = 0; state.prevFrac = null; state.prevFracTime = 0; hideResult(); setStatus('就位…等待通過'); updateActionBtn(); }
+  function resetGate() { state.phase = 'idle'; state.prevFrac = null; updateActionBtn(); }
 
   function gateStep(frame) {
-    const { point, valid, w, dt } = frame;
+    const { point, valid, w } = frame;
     drawScene(frame);
+    const now = performance.now();
 
     if (!valid || !point) {
-      if (state.visionMode === 'motion') state.prevFrac = null; // 球沒動時不要誤判
-      decayLive(dt);
+      // 影格之間相機可能還沒更新 → 暫時保留上一個位置，超過 HOLD_MS 才清空
+      if (state.prevFrac != null && now - state.prevFracTime > HOLD_MS) state.prevFrac = null;
+      decayLive();
+      // 計時太久沒到終點 → 重新就位
+      if (state.phase === 'timing' && now - state.t1 > 8000) arm();
       return;
     }
     const frac = point.x / w;
+    const p = state.prevFrac;
+    const jump = p != null ? Math.abs(frac - p) : 0;
 
     // 即時速度（用校正比例換算）
     const span = Math.abs(state.gateB - state.gateA) * w || 1;
     const mPerPx = state.distance / span;
-    if (state.prevFrac != null && dt > 0) {
-      const dxPx = Math.abs(frac - state.prevFrac) * w;
-      const inst = dxPx * mPerPx / dt * 3.6;
-      state.liveSpeed = state.liveSpeed * 0.6 + inst * 0.4;
-      updateLive();
+    if (p != null && jump < 0.5) {
+      const ddt = (now - state.prevFracTime) / 1000;
+      if (ddt > 0) {
+        const inst = Math.abs(frac - p) * w * mPerPx / ddt * 3.6;
+        if (inst < 90) { state.liveSpeed = state.liveSpeed * 0.6 + inst * 0.4; updateLive(); }
+      }
     }
 
-    if (state.phase === 'armed' || state.phase === 'timing') {
-      const p = state.prevFrac;
-      if (p != null) {
-        const now = performance.now();
-        const crossA = (p - state.gateA) * (frac - state.gateA) < 0;
-        const crossB = (p - state.gateB) * (frac - state.gateB) < 0;
-        if (state.phase === 'armed' && (crossA || crossB)) {
-          state.phase = 'timing'; state.t1 = now;
-          state.firstIsA = crossA;        // 從哪條線起跑就往另一條算
-          setStatus('計時中… 衝啊！');
-        } else if (state.phase === 'timing') {
-          const finished = state.firstIsA ? crossB : crossA;
-          if (finished) {
-            const sec = (now - state.t1) / 1000;
-            if (sec > 0.08) { state.phase = 'done'; complete(sec); }
-          } else if (now - state.t1 > 7000) {
-            arm(); // 太久沒到終點，重新就位
-          }
+    // 過線判定（忽略瞬間大跳動，避免雜訊/畫面回捲誤觸）
+    if ((state.phase === 'armed' || state.phase === 'timing') && p != null && jump < 0.5) {
+      const crossA = (p - state.gateA) * (frac - state.gateA) < 0;
+      const crossB = (p - state.gateB) * (frac - state.gateB) < 0;
+      if (state.phase === 'armed' && (crossA || crossB)) {
+        state.phase = 'timing'; state.t1 = now;
+        state.firstIsA = crossA;        // 從哪條線起跑就往另一條算
+        setStatus('計時中… 衝啊！'); updateActionBtn();
+      } else if (state.phase === 'timing') {
+        const finished = state.firstIsA ? crossB : crossA;
+        if (finished) {
+          const sec = (now - state.t1) / 1000;
+          if (sec > 0.06) { state.phase = 'done'; complete(sec); }
         }
       }
     }
     state.prevFrac = frac;
+    state.prevFracTime = now;
   }
 
-  function decayLive(dt) { state.liveSpeed *= 0.9; if (state.liveSpeed < 0.3) state.liveSpeed = 0; updateLive(); }
+  function decayLive() { state.liveSpeed *= 0.9; if (state.liveSpeed < 0.3) state.liveSpeed = 0; updateLive(); }
   function updateLive() { liveEl.innerHTML = state.liveSpeed.toFixed(1) + ' <small>km/h</small>'; }
 
   function complete(sec) {
     const kmh = state.distance / sec * 3.6;
     if (navigator.vibrate) navigator.vibrate(60);
     if (state.onMeasure) state.onMeasure(kmh, sec);
+    updateActionBtn();
+  }
+
+  // ---------- 開始 / 停止流程（主按鈕）----------
+  function labelForMode() {
+    if (state.mode === 'run') return '🏁 開始計時';
+    if (state.mode === 'kick') return '⚽️ 準備踢球';
+    if (state.mode === 'race') return '🏁 ' + race.players[race.cur].name + ' 開始';
+    return '開始';
+  }
+  function updateActionBtn() {
+    const b = document.querySelector('#goBtn'); if (!b) return;
+    const active = state.counting || state.phase === 'armed' || state.phase === 'timing';
+    if (active) { b.textContent = '■ 停止／重來'; b.classList.add('stop'); b.onclick = stopFlow; }
+    else { b.textContent = labelForMode(); b.classList.remove('stop'); b.onclick = startFlow; }
+  }
+  async function startFlow() {
+    if (!Vision.isLive()) { await openCamera(); if (!Vision.isLive()) return; }
+    hideResult();
+    if (state.mode === 'kick') { arm(); setStatus('就位…踢出球吧！'); }
+    else {
+      state.counting = true; updateActionBtn();
+      countdown(3, () => { state.counting = false; arm(); });
+    }
+  }
+  function stopFlow() {
+    state.counting = false;
+    if (state.cdTimer) { clearTimeout(state.cdTimer); state.cdTimer = null; }
+    countdownEl.hidden = true;
+    resetGate();
+    state.liveSpeed = 0; updateLive();
+    setStatus('已就緒，按開始');
   }
 
   // ---------- 畫面繪製（線、追蹤點、骨架）----------
@@ -225,11 +263,12 @@
   function countdown(n, done) {
     countdownEl.hidden = false;
     (function tick() {
+      if (!state.counting) { countdownEl.hidden = true; return; } // 已被停止
       if (n <= 0) { countdownEl.hidden = true; done(); return; }
       countdownEl.textContent = n; countdownEl.classList.remove('pop');
       void countdownEl.offsetWidth; countdownEl.classList.add('pop');
       if (navigator.vibrate) navigator.vibrate(30);
-      n--; setTimeout(tick, 800);
+      n--; state.cdTimer = setTimeout(tick, 800);
     })();
   }
 
@@ -249,13 +288,8 @@
       </div>
       <p class="hint">手機架在<b>側面</b>，讓 Miles 橫向跑過畫面。拖曳綠線/紅線對準起跑與終點。</p>`;
     wireDistance();
-    $('#goBtn').onclick = () => startRound();
+    updateActionBtn();
     $('#manualBtn').onclick = manualTimer;
-  }
-
-  function startRound() {
-    if (!Vision.isLive()) { return openCamera(); }
-    countdown(3, () => { arm(); });
   }
 
   // ====================================================================
@@ -263,7 +297,7 @@
   // ====================================================================
   const race = { players: [{ name: 'Miles', emoji: '🟠' }, { name: '姊姊', emoji: '🔵' }], cur: 0, results: [] };
   function mountRace() {
-    race.cur = 0; race.results = [];
+    race.cur = 0; race.results = []; state.phase = 'idle'; state.counting = false;
     state.onMeasure = (kmh, sec) => {
       race.results[race.cur] = { kmh, sec };
       if (race.cur === 0) {
@@ -291,7 +325,8 @@
       </div>
       <p class="hint">同一條跑道，兩人輪流跑。跑完自動換下一位，最後比出贏家！</p>`;
     wireDistance();
-    $('#goBtn').onclick = () => startRound();
+    state.phase = 'idle'; state.counting = false;
+    updateActionBtn();
     $('#resetRace').onclick = () => { hideResult(); mountRace(); };
   }
   function finishRace() {
@@ -341,6 +376,7 @@
       </div>
       <div class="btn-row">
         <button class="big" id="goBtn">⚽️ 準備踢球</button>
+        <button class="secondary" id="manualBtn">手動</button>
       </div>
       <p class="hint">手機架在<b>側面</b>對準球的路線，球飛過兩條線就會測出球速。背景單純、亮色球最準。</p>`;
     wireDistance();
@@ -350,7 +386,8 @@
       sensV.textContent = +sens.value < 22 ? '高' : (+sens.value > 38 ? '低' : '中');
     };
     Vision.setSensitivity(+sens.value);
-    $('#goBtn').onclick = () => { if (!Vision.isLive()) return openCamera(); arm(); setStatus('就位…踢出球吧！'); };
+    updateActionBtn();
+    $('#manualBtn').onclick = manualTimer;
   }
 
   // ---------- 共用：距離控制 ----------
