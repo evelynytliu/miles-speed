@@ -18,6 +18,7 @@
     phase: 'idle',        // idle | armed | timing | done
     t1: 0, firstIsA: true, prevFrac: null, prevFracTime: 0,
     counting: false, cdTimer: null,
+    record: true,
     liveSpeed: 0,
     onMeasure: null,      // (kmh, dt) => void
     visionMode: 'pose',
@@ -58,7 +59,11 @@
   // ---------- 計時門偵測 ----------
   const HOLD_MS = 320;   // 短暫偵測不到時，保留上一個位置多久（解決相機/畫面更新不同步）
 
-  function arm() { state.phase = 'armed'; state.t1 = 0; state.prevFrac = null; state.prevFracTime = 0; hideResult(); setStatus('就位…等待通過'); updateActionBtn(); }
+  function arm() {
+    state.phase = 'armed'; state.t1 = 0; state.prevFrac = null; state.prevFracTime = 0;
+    hideResult(); setStatus('就位…等待通過'); updateActionBtn();
+    if (state.record && Vision.isLive() && !Vision.isRecording()) Vision.startRecording();
+  }
   function resetGate() { state.phase = 'idle'; state.prevFrac = null; updateActionBtn(); }
 
   function gateStep(frame) {
@@ -110,13 +115,17 @@
   }
 
   function decayLive() { state.liveSpeed *= 0.9; if (state.liveSpeed < 0.3) state.liveSpeed = 0; updateLive(); }
-  function updateLive() { liveEl.innerHTML = state.liveSpeed.toFixed(1) + ' <small>km/h</small>'; }
+  function updateLive() {
+    liveEl.innerHTML = state.liveSpeed.toFixed(1) + ' <small>km/h</small>';
+    Vision.setHud({ speed: state.liveSpeed > 0.3 ? state.liveSpeed.toFixed(1) + ' km/h' : '' });
+  }
 
   function complete(sec) {
     const kmh = state.distance / sec * 3.6;
     if (navigator.vibrate) navigator.vibrate(60);
-    if (state.onMeasure) state.onMeasure(kmh, sec);
-    updateActionBtn();
+    const finalize = (blob) => { if (state.onMeasure) state.onMeasure(kmh, sec, blob); updateActionBtn(); };
+    if (Vision.isRecording()) Vision.stopRecording().then(finalize);
+    else finalize(null);
   }
 
   // ---------- 開始 / 停止流程（主按鈕）----------
@@ -145,6 +154,7 @@
     state.counting = false;
     if (state.cdTimer) { clearTimeout(state.cdTimer); state.cdTimer = null; }
     countdownEl.hidden = true;
+    if (Vision.isRecording()) Vision.stopRecording();   // 取消這次錄影
     resetGate();
     state.liveSpeed = 0; updateLive();
     setStatus('已就緒，按開始');
@@ -221,7 +231,7 @@
   const RUN_CHEERS = ['哇！你像一隻小獵豹！', '太快了吧！再來一次！', '咻──超快的！', '你是閃電俠嗎？', '厲害！腳步好快！'];
   const KICK_CHEERS = ['好強的一腳！', '咻！這球飛超遠！', '射門！好厲害！', '這一腳超有力！'];
 
-  function celebrate(kmh, best, mode) {
+  function celebrate(kmh, best, mode, blob) {
     const accent = state.accent;
     const cheers = mode === 'kick' ? KICK_CHEERS : RUN_CHEERS;
     const cheer = cheers[Math.floor(performance.now() / 137) % cheers.length];
@@ -231,9 +241,51 @@
       <div class="result-sub">${mode === 'kick' ? '球速' : '速度'} · 約 ${(kmh / 3.6).toFixed(1)} 公尺/秒</div>
       ${best ? '<div class="bestbadge">🎉 破紀錄！</div>' : ''}
       <div class="result-cheer">📣 「${cheer}」</div>
+      <div class="replay-slot"></div>
     </div>`);
     if (best) confetti();
     speak((best ? '破紀錄了！' : '') + cheer + ' 時速' + kmh.toFixed(0) + '公里');
+    attachReplay(blob, mode, kmh);
+  }
+
+  // ---------- 重播 + 存到手機 ----------
+  let lastClipUrl = null;
+  function attachReplay(blob, mode, kmh) {
+    const slot = resultEl.querySelector('.replay-slot');
+    if (!slot) return;
+    if (!blob) {
+      if (state.record && Vision.isLive())
+        slot.innerHTML = '<p class="replay-note">這次沒錄到影片（瀏覽器可能不支援錄影）。</p>';
+      return;
+    }
+    if (lastClipUrl) URL.revokeObjectURL(lastClipUrl);
+    lastClipUrl = URL.createObjectURL(blob);
+    const name = `miles-${mode}-${kmh.toFixed(0)}kmh.${Vision.recExt()}`;
+    slot.innerHTML = `
+      <video class="replay-video" src="${lastClipUrl}" playsinline muted loop autoplay controls></video>
+      <div class="btn-row">
+        <button class="big" id="saveClip">💾 存到手機</button>
+        <button class="secondary" id="replayClip">🔁 重看</button>
+      </div>`;
+    const v = slot.querySelector('.replay-video');
+    slot.querySelector('#replayClip').onclick = () => { v.currentTime = 0; v.play(); };
+    slot.querySelector('#saveClip').onclick = () => saveVideo(blob, name);
+  }
+
+  async function saveVideo(blob, name) {
+    const type = blob.type || 'video/webm';
+    try {
+      const file = new File([blob], name, { type });
+      if (navigator.canShare && navigator.canShare({ files: [file] })) {
+        await navigator.share({ files: [file], title: 'Miles 速度王' });
+        return;
+      }
+    } catch (e) { if (e && e.name === 'AbortError') return; }
+    // 後備：直接下載
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 15000);
   }
 
   // ---------- 五彩紙花 ----------
@@ -276,9 +328,9 @@
   //  模式：跑步
   // ====================================================================
   function mountRun() {
-    state.onMeasure = (kmh) => {
+    state.onMeasure = (kmh, sec, blob) => {
       const best = checkBest('run', kmh);
-      celebrate(kmh, best, 'run');
+      celebrate(kmh, best, 'run', blob);
       setStatus('完成！按「再來一次」');
     };
     panel.innerHTML = distanceControl() + `
@@ -286,8 +338,9 @@
         <button class="big" id="goBtn">🏁 開始計時</button>
         <button class="secondary" id="manualBtn">手動</button>
       </div>
-      <p class="hint">手機架在<b>側面</b>，讓 Miles 橫向跑過畫面。拖曳綠線/紅線對準起跑與終點。</p>`;
-    wireDistance();
+      <p class="hint">手機架在<b>側面</b>，讓 Miles 橫向跑過畫面。拖曳綠線/紅線對準起跑與終點。</p>
+      ${recordToggle()}`;
+    wireDistance(); wireRecord();
     updateActionBtn();
     $('#manualBtn').onclick = manualTimer;
   }
@@ -298,8 +351,8 @@
   const race = { players: [{ name: 'Miles', emoji: '🟠' }, { name: '姊姊', emoji: '🔵' }], cur: 0, results: [] };
   function mountRace() {
     race.cur = 0; race.results = []; state.phase = 'idle'; state.counting = false;
-    state.onMeasure = (kmh, sec) => {
-      race.results[race.cur] = { kmh, sec };
+    state.onMeasure = (kmh, sec, blob) => {
+      race.results[race.cur] = { kmh, sec, blob };
       if (race.cur === 0) {
         speak(race.players[0].name + ' 跑了 ' + sec.toFixed(1) + ' 秒，換 ' + race.players[1].name);
         race.cur = 1; renderRace(); setStatus(race.players[1].name + ' 準備，按開始');
@@ -323,8 +376,9 @@
         <button class="big" id="goBtn">🏁 ${race.players[race.cur].name} 開始</button>
         <button class="secondary" id="resetRace">重來</button>
       </div>
-      <p class="hint">同一條跑道，兩人輪流跑。跑完自動換下一位，最後比出贏家！</p>`;
-    wireDistance();
+      <p class="hint">同一條跑道，兩人輪流跑。跑完自動換下一位，最後比出贏家！</p>
+      ${recordToggle()}`;
+    wireDistance(); wireRecord();
     state.phase = 'idle'; state.counting = false;
     updateActionBtn();
     $('#resetRace').onclick = () => { hideResult(); mountRace(); };
@@ -340,10 +394,28 @@
       <div style="font-size:24px;font-weight:800;color:${state.accent};margin-top:4px;">${win.emoji} ${win.name} 贏了！</div>
       <div class="result-sub">快了 ${diff.toFixed(2)} 秒 · 最高 ${maxKmh.toFixed(1)} km/h</div>
       <div class="replay" id="replay"></div>
+      <div class="race-clips" id="raceClips"></div>
     </div>`);
     animateReplay(a, b);
+    attachRaceClips();
     confetti();
     speak(win.name + ' 贏了！快了 ' + diff.toFixed(1) + ' 秒');
+  }
+  function attachRaceClips() {
+    const box = $('#raceClips'); if (!box) return;
+    box.innerHTML = race.players.map((p, i) => race.results[i] && race.results[i].blob ? `
+      <div class="clip-card">
+        <div class="clip-head">${p.emoji} ${p.name} · ${race.results[i].kmh.toFixed(1)} km/h</div>
+        <video class="replay-video" playsinline muted loop autoplay controls></video>
+        <button class="secondary save-leg" data-i="${i}">💾 存到手機</button>
+      </div>` : '').join('');
+    box.querySelectorAll('.clip-card').forEach((card) => {
+      const i = +card.querySelector('.save-leg').dataset.i;
+      const r = race.results[i];
+      const url = URL.createObjectURL(r.blob);
+      card.querySelector('video').src = url;
+      card.querySelector('.save-leg').onclick = () => saveVideo(r.blob, `miles-race-${race.players[i].name}-${r.kmh.toFixed(0)}kmh.${Vision.recExt()}`);
+    });
   }
   function animateReplay(a, b) {
     const rep = $('#replay'); const dur = Math.max(a.sec, b.sec);
@@ -363,9 +435,9 @@
   //  模式：踢球（移動追蹤）
   // ====================================================================
   function mountKick() {
-    state.onMeasure = (kmh) => {
+    state.onMeasure = (kmh, sec, blob) => {
       const best = checkBest('kick', kmh);
-      celebrate(kmh, best, 'kick');
+      celebrate(kmh, best, 'kick', blob);
       setStatus('完成！按「再踢一球」');
     };
     panel.innerHTML = distanceControl() + `
@@ -378,8 +450,9 @@
         <button class="big" id="goBtn">⚽️ 準備踢球</button>
         <button class="secondary" id="manualBtn">手動</button>
       </div>
-      <p class="hint">手機架在<b>側面</b>對準球的路線，球飛過兩條線就會測出球速。背景單純、亮色球最準。</p>`;
-    wireDistance();
+      <p class="hint">手機架在<b>側面</b>對準球的路線，球飛過兩條線就會測出球速。背景單純、亮色球最準。</p>
+      ${recordToggle()}`;
+    wireDistance(); wireRecord();
     const sens = $('#sens'), sensV = $('#sensV');
     sens.oninput = () => {
       Vision.setSensitivity(+sens.value);
@@ -401,6 +474,12 @@
   function wireDistance() {
     const d = $('#dist'), v = $('#distV'); if (!d) return;
     d.oninput = () => { state.distance = +d.value; v.textContent = state.distance + ' m'; };
+  }
+  function recordToggle() {
+    return `<label class="rec-toggle"><input type="checkbox" id="recChk" ${state.record ? 'checked' : ''}> 📹 自動錄影（測完可重播、存到手機）</label>`;
+  }
+  function wireRecord() {
+    const c = $('#recChk'); if (c) c.onchange = () => { state.record = c.checked; };
   }
 
   // ---------- 手動計時（無鏡頭備案）----------
@@ -443,6 +522,10 @@
     const cfg = MODES[mode];
     state.mode = mode; state.visionMode = cfg.vision; state.accent = cfg.accent; state.distance = cfg.distance;
     document.body.dataset.mode = mode;
+    state.counting = false;
+    if (state.cdTimer) { clearTimeout(state.cdTimer); state.cdTimer = null; }
+    if (Vision.isRecording()) Vision.stopRecording();
+    countdownEl.hidden = true;
     resetGate(); hideResult(); state.liveSpeed = 0; updateLive();
     document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
     coverEmoji.textContent = cfg.emoji;

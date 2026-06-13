@@ -14,6 +14,11 @@ const Vision = (function () {
   let prevGray = null;
   let motionThreshold = 28;     // 像素差門檻（越小越敏感）
 
+  // 錄影（錄的是「影像 + 骨架/線/速度」的合成畫面）
+  let recorder = null, recChunks = [], recStream = null, recMime = '', recording = false;
+  let recCanvas = null, recCtx = null;
+  let hud = { speed: '' };
+
   function init(v, c) {
     video = v; canvas = c; ctx = canvas.getContext('2d');
   }
@@ -112,6 +117,39 @@ const Vision = (function () {
     requestAnimationFrame(loop);
   }
 
+  // ---------- 錄影（直接錄相機串流，不在每格合成，避免拖慢偵測）----------
+  function pickMime() {
+    const cands = ['video/mp4;codecs=avc1', 'video/mp4', 'video/webm;codecs=vp9', 'video/webm;codecs=vp8', 'video/webm'];
+    if (!window.MediaRecorder) return '';
+    for (const m of cands) { try { if (MediaRecorder.isTypeSupported(m)) return m; } catch (e) {} }
+    return '';
+  }
+  function startRecording() {
+    if (!stream || !window.MediaRecorder) return false;
+    recMime = pickMime();
+    try { recorder = new MediaRecorder(stream, recMime ? { mimeType: recMime, videoBitsPerSecond: 6000000 } : undefined); }
+    catch (e) { try { recorder = new MediaRecorder(stream); } catch (e2) { return false; } }
+    recChunks = [];
+    recorder.ondataavailable = e => { if (e.data && e.data.size) recChunks.push(e.data); };
+    recording = true;
+    try { recorder.start(); } catch (e) { recording = false; return false; }
+    return true;
+  }
+  function stopRecording() {
+    return new Promise(res => {
+      if (!recorder || recorder.state === 'inactive') { recording = false; return res(null); }
+      recorder.onstop = () => {
+        recording = false;
+        const type = recMime || 'video/webm';
+        res(recChunks.length ? new Blob(recChunks, { type }) : null);
+      };
+      try { recorder.stop(); } catch (e) { recording = false; res(null); }
+    });
+  }
+  function isRecording() { return recording; }
+  function setHud(h) { hud = h || { speed: '' }; }
+  function recExt() { return (recMime || '').indexOf('mp4') >= 0 ? 'mp4' : 'webm'; }
+
   // 影格相減找出移動最劇烈的區塊中心（追球用）
   function motionCentroid() {
     sctx.drawImage(video, 0, 0, small.width, small.height);
@@ -170,5 +208,6 @@ const Vision = (function () {
     });
   }
 
-  return { init, start, stop, setMode, setOnFrame, setSensitivity, ensurePose, isLive, hasPose, drawSkeleton };
+  return { init, start, stop, setMode, setOnFrame, setSensitivity, ensurePose, isLive, hasPose, drawSkeleton,
+    startRecording, stopRecording, isRecording, setHud, recExt };
 })();
